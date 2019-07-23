@@ -7,9 +7,10 @@ Parameters:
   BucketName:
     Description: Bucket name with objects for which we want to create signed urls
     Type: String
-  BucketKey:
+  ObjectKey:
     Description: Bucket objects key (path)
     Type: String
+    Default: '/'
   CreateBucket:
     Description: If we want to use existing bucket or create a new one
     Type: String
@@ -20,6 +21,10 @@ Parameters:
     Type: String
     Default: delete
     AllowedValues: [ delete, move]
+  LogLevel:
+    Description: Lambda log level
+    Type: String
+    AllowedValues: [ info, debug ]
 
 Conditions:
   CreateBucket: !Equals [ !Ref CreateBucket, true ]
@@ -49,25 +54,54 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource:
-                  - !Sub 'arn:aws:s3:::${BucketName}/${BucketKey}/*'
+                  - !Sub 'arn:aws:s3:::${BucketName}${ObjectKey}/*'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-    AMIIDLookup:
-      Type: "AWS::Lambda::Function"
-      Properties:
-        Handler: "index.handler"
-        Role:
-          Fn::GetAtt:
-            - "LambdaExecutionRole"
-            - "Arn"
-        Code:
-          S3Bucket: "lambda-functions"
-          S3Key: "amilookup.zip"
-        Runtime: "nodejs8.10"
-        Timeout: 25
-        TracingConfig:
-          Mode: "Active"
+  LambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Role: !GetAtt LambdaRole.Arn
+      Handler: lambda_handler
+      Runtime: python3.7
+      Timeout: 25
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          bucket = os.environ['BUCKET']
+          object_key = os.environ['OBJECT_KEY']
+          burn_method = os.environ['BURN_METHOD']
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          session = boto3.session.Session()
+          client = session.client('s3')
+
+          def lambda_handler(event, context):
+            logger.debug(event)
+            key = event['detail']['requestParameters']['key']
+
+            print(event['detail']['eventName'])
+
+            if event['detail']['eventName'] == "GetObject":
+              logger.debug('Deleting object %s' % key)
+              try:
+                response = client.delete_object(
+                Bucket=bucket,
+                Key=key
+                )
+                logger.info('Object %s deleted.' % key)
+              except Exception as e:
+                logger.exception(e)
+      Environment:
+        Variables:
+          BUCKET: !Ref BucketName
+          OBJECT_KEY: !Ref ObjectKey
+          BURN_METHOD: !Ref BurnMethod
 
   Bucket:
     Condition: CreateBucket
@@ -101,3 +135,15 @@ Resources:
             Resource:
               - !GetAtt Bucket.Arn
               - !Join [ '', [ !GetAtt Bucket.Arn, '/*'] ]
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref Bucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      EventSelectors:
+        DataResources:
+          Type: AWS::S3::Object
+          Values:
+            - !Sub ' arn:aws:s3:::${Bucket}${ObjectKey}'
