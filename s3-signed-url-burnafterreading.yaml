@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: S3 - Signed link burn after reading mechanism
+
+Parameters:
+
+  BucketName:
+    Description: Bucket name with objects for which we want to create signed urls
+    Type: String
+  BucketKey:
+    Description: Bucket objects key (path)
+    Type: String
+  CreateBucket:
+    Description: If we want to use existing bucket or create a new one
+    Type: String
+    Default: no
+    AllowedValues: [ yes, no ]
+  BurnMethod:
+    Description: S3 link invalidation by deletion of object or moving to different path
+    Type: String
+    Default: delete
+    AllowedValues: [ delete, move]
+
+Conditions:
+  CreateBucket: !Equals [ !Ref CreateBucket, true ]
+
+Resources:
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: S3DeleteMove
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}/${BucketKey}/*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+    AMIIDLookup:
+      Type: "AWS::Lambda::Function"
+      Properties:
+        Handler: "index.handler"
+        Role:
+          Fn::GetAtt:
+            - "LambdaExecutionRole"
+            - "Arn"
+        Code:
+          S3Bucket: "lambda-functions"
+          S3Key: "amilookup.zip"
+        Runtime: "nodejs8.10"
+        Timeout: 25
+        TracingConfig:
+          Mode: "Active"
+
+  Bucket:
+    Condition: CreateBucket
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  BucketPolicy:
+    Condition: CreateBucket
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: Bucket policy
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Ref LambdaRole
+            Action:
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:PutObject
+            Resource:
+              - !GetAtt Bucket.Arn
+              - !Join [ '', [ !GetAtt Bucket.Arn, '/*'] ]
