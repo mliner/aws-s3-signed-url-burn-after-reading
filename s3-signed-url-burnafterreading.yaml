@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: 2010-09-09
 
-Description: S3 - Signed link burn after reading mechanism
+Description: S3 - Signed url burn after reading mechanism
 
 Parameters:
 
@@ -20,11 +20,7 @@ Parameters:
     Description: S3 link invalidation by deletion of object or moving to different path
     Type: String
     Default: delete
-    AllowedValues: [ delete, move]
-  LogLevel:
-    Description: Lambda log level
-    Type: String
-    AllowedValues: [ info, debug ]
+    AllowedValues: [ delete, move ]
 
 Conditions:
   CreateBucket: !Equals [ !Ref CreateBucket, true ]
@@ -62,14 +58,16 @@ Resources:
     Type: "AWS::Lambda::Function"
     Properties:
       Role: !GetAtt LambdaRole.Arn
-      Handler: lambda_handler
+      Handler: index.lambda_handler
       Runtime: python3.7
       Timeout: 25
       Code:
         ZipFile: |
+          import os
           import json
           import boto3
           import logging
+          from botocore.exceptions import ClientError
 
           bucket = os.environ['BUCKET']
           object_key = os.environ['OBJECT_KEY']
@@ -81,22 +79,56 @@ Resources:
           session = boto3.session.Session()
           client = session.client('s3')
 
+          def getObject(_bucket, _key):
+            try:
+                client.head_object(Bucket=_bucket, Key=_key)
+            except ClientError as e:
+              logging.error(e)
+              return False
+            return True
+
+          def invalidate(_burn_method, _bucket, _key):
+            if _burn_method == "delete":
+              try:
+                response = client.delete_object(
+                  Bucket=_bucket,
+                  Key=_key
+                )
+                logger.info('Deleting object %s' % _key)
+              except ClientError as e:
+                logging.error(e)
+
+            elif _burn_method == "move":
+
+              try:
+                response = client.copy_object(CopySource='%s/%s'% (_bucket, _key), Bucket=_bucket, Key='invalid/%s' % _key)
+                logger.info('Deleting object %s' % _key)
+              except ClientError as e:
+                logging.error(e)
+
+              try:
+                response = client.delete_object(
+                  Bucket=_bucket,
+                  Key=_key
+                )
+                logger.info('Deleting object %s' % _key)
+              except ClientError as e:
+                logging.error(e)
+
+            else:
+              logger.error('Method %s not supported' % _burn_method)
+
           def lambda_handler(event, context):
             logger.debug(event)
             key = event['detail']['requestParameters']['key']
 
-            print(event['detail']['eventName'])
-
             if event['detail']['eventName'] == "GetObject":
               logger.debug('Deleting object %s' % key)
-              try:
-                response = client.delete_object(
-                Bucket=bucket,
-                Key=key
-                )
-                logger.info('Object %s deleted.' % key)
-              except Exception as e:
-                logger.exception(e)
+
+              if not getObject(bucket, key):
+                return "Object does not exist on path %s" % key
+
+              invalidate(burn_method, bucket, key)
       Environment:
         Variables:
           BUCKET: !Ref BucketName
@@ -106,7 +138,6 @@ Resources:
   Bucket:
     Condition: CreateBucket
     Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
     Properties:
       BucketName: !Ref BucketName
       BucketEncryption:
@@ -118,6 +149,7 @@ Resources:
 
   BucketPolicy:
     Condition: CreateBucket
+    DependsOn: LambdaRole
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref Bucket
@@ -127,7 +159,7 @@ Resources:
             Effect: Allow
             Principal:
               AWS:
-                - !Ref LambdaRole
+                - !GetAtt LambdaRole.Arn
             Action:
               - s3:DeleteObject
               - s3:GetObject
@@ -136,14 +168,82 @@ Resources:
               - !GetAtt Bucket.Arn
               - !Join [ '', [ !GetAtt Bucket.Arn, '/*'] ]
 
-  Trail:
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudtrail-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub ${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrail:
+    DependsOn: CloudTrailBucketPolicy
     Type: AWS::CloudTrail::Trail
     Properties:
-      S3BucketName: !Ref Bucket
+      EventSelectors:
+      - DataResources:
+        - Type: AWS::S3::Object
+          Values:
+            - !Sub ${Bucket.Arn}/
+        IncludeManagementEvents: false
+        ReadWriteType: ReadOnly
+      IncludeGlobalServiceEvents: true
       IsLogging: true
       IsMultiRegionTrail: false
-      EventSelectors:
-        DataResources:
-          Type: AWS::S3::Object
-          Values:
-            - !Sub ' arn:aws:s3:::${Bucket}${ObjectKey}'
+      S3BucketName: !Ref CloudTrailBucket
+
+  Event:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: S3 event
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - GetObject
+          requestParameters:
+            bucketName:
+              - !Ref Bucket
+      Name: S3SignedUrlLinkInvalidation
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: LamdaFunction
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt Event.Arn
